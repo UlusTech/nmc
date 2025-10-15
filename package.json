@@ -8,5 +8,8 @@
   },
   "peerDependencies": {
     "typescript": "^5"
+  },
+  "dependencies": {
+    "@std/encoding": "npm:@jsr/std__encoding"
   }
 }
