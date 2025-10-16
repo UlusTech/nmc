@@ -1,68 +1,59 @@
-/**
- * Protocol packet type definitions
- */
+// ============================================
+// FILE: src/protocol/types.ts
+// ============================================
 
-import type { ConnectionState } from "./constants";
+/** 3D position vector */
+export type Vector3 = {
+    x: number;
+    y: number;
+    z: number;
+};
 
-/**
- * Base packet structure
- */
-export interface Packet {
-    state: ConnectionState;
-    id: number;
-}
+/** Connection state in protocol state machine */
+export type ConnectionState = "handshaking" | "status" | "login" | "play";
 
-/**
- * Handshake packet (C->S)
- */
-export interface HandshakePacket extends Packet {
-    state: ConnectionState.HANDSHAKING;
-    id: 0x00;
+/** Base packet structure */
+export type BasePacket = {
+    type: string;
+};
+
+// ============================================
+// Handshaking packets
+// ============================================
+
+export type HandshakePacket = BasePacket & {
+    type: "handshake";
     protocolVersion: number;
     serverAddress: string;
     serverPort: number;
-    nextState: ConnectionState.STATUS | ConnectionState.LOGIN;
-}
+    nextState: 1 | 2; // 1 = status, 2 = login
+};
 
-/**
- * Status Request packet (C->S)
- */
-export interface StatusRequestPacket extends Packet {
-    state: ConnectionState.STATUS;
-    id: 0x00;
-}
+// ============================================
+// Status packets (server list ping)
+// ============================================
 
-/**
- * Status Response packet (S->C)
- */
-export interface StatusResponsePacket extends Packet {
-    state: ConnectionState.STATUS;
-    id: 0x00;
-    json: string;
-}
+export type StatusRequestPacket = BasePacket & {
+    type: "status_request";
+};
 
-/**
- * Ping packet (C->S)
- */
-export interface PingPacket extends Packet {
-    state: ConnectionState.STATUS;
-    id: 0x01;
+export type StatusResponsePacket = BasePacket & {
+    type: "status_response";
+    response: StatusResponse;
+};
+
+export type PingRequestPacket = BasePacket & {
+    type: "ping_request";
     payload: bigint;
-}
+};
 
-/**
- * Pong packet (S->C)
- */
-export interface PongPacket extends Packet {
-    state: ConnectionState.STATUS;
-    id: 0x01;
+export type PingResponsePacket = BasePacket & {
+    type: "ping_response";
     payload: bigint;
-}
+};
 
-/**
- * Server status JSON structure
- */
-export interface ServerStatusJson {
+/** Server status response (what client sees in multiplayer list) */
+export type StatusResponse = {
     version: {
         name: string;
         protocol: number;
@@ -75,20 +66,31 @@ export interface ServerStatusJson {
     description: {
         text: string;
     };
-    favicon?: string;
-}
+    favicon?: string; // base64 encoded PNG
+    enforcesSecureChat?: boolean;
+    previewsChat?: boolean;
+};
 
-/**
- * Union of all clientbound packets (C->S)
- */
-export type ClientboundPacket =
+// ============================================
+// Incoming packets (from client)
+// ============================================
+
+export type IncomingPacket =
     | HandshakePacket
     | StatusRequestPacket
-    | PingPacket;
+    | PingRequestPacket;
 
-/**
- * Union of all serverbound packets (S->C)
- */
-export type ServerboundPacket =
-    | StatusResponsePacket
-    | PongPacket;
+// ============================================
+// Outgoing packets (to client)
+// ============================================
+
+export type OutgoingPacket = StatusResponsePacket | PingResponsePacket;
+
+/** Result of packet decode attempt */
+export type DecodeResult =
+    | { success: true; packet: IncomingPacket; remaining: Uint8Array }
+    | {
+        success: false;
+        reason: "incomplete" | "invalid";
+        remaining: Uint8Array;
+    };

@@ -1,267 +1,186 @@
-/**
- * NeoMinecraft - Main entry point
- * Pipeline: network → protocol → server-logic → game-logic
- */
+// ============================================
+// FILE: src/main.ts
+// ============================================
 
-import type { ServerWebSocket } from "bun";
-import type { Connection, NetworkData } from "./network/types";
-import type { ProtocolState } from "./protocol/states";
-import type { HandshakePacket, ServerStatusJson } from "./protocol/types";
-import { createProtocolState, transitionState } from "./protocol/states";
-import { decodePacket } from "./protocol/codec/decode";
-import { encodePacket } from "./protocol/codec/encode";
+import type { Socket } from "bun";
+import { decodePacket } from "./protocol/codec/decode.ts";
+import { encodePacket } from "./protocol/codec/encode.ts";
+import type { OutgoingPacket } from "./protocol/types.ts";
 import {
-    ConnectionState,
-    MINECRAFT_VERSION,
-    PROTOCOL_VERSION,
-} from "./protocol/constants";
-import { decodeVarint32 } from "@std/encoding/varint";
+    addConnection,
+    createInitialState,
+    removeConnection,
+    type ServerState,
+    updateConnection,
+} from "./server-logic/state.ts";
+import { type EffectInterpreter, runEffects } from "./server-logic/effects.ts";
+import { handlePacket } from "./server-logic/events/handlePacket.ts";
 
-// Server configuration
-const CONFIG = {
-    hostname: "0.0.0.0",
-    port: 25565,
-    motd: "§6Neo§fMinecraft §8- §7Built with Bun & TypeScript",
-    maxPlayers: 100,
-} as const;
+const PORT = 25565;
 
-// Connection state tracking
-interface ClientState {
-    socket: ServerWebSocket<ClientData>;
-    connection: Connection;
-    protocol: ProtocolState;
-    buffer: Uint8Array;
-    bufferLength: number;
-}
+function createServer() {
+    // Mutable state (only place in entire codebase)
+    let state: ServerState = createInitialState();
 
-interface ClientData {
-    state: ClientState;
-}
+    // Socket registry for sending packets
+    const sockets = new Map<string, Socket>();
 
-const clients = new Map<string, ClientState>();
-
-console.log("🎮 NeoMinecraft - Starting server...");
-console.log(`📍 Port: ${CONFIG.port}`);
-console.log(`📦 Protocol: ${PROTOCOL_VERSION} (MC ${MINECRAFT_VERSION})\n`);
-
-// Start TCP server using Bun.listen
-const server = Bun.listen<ClientData>({
-    hostname: CONFIG.hostname,
-    port: CONFIG.port,
-    socket: {
-        /**
-         * New connection opened
-         */
-        open(socket) {
-            const connection: Connection = {
-                id: crypto.randomUUID(),
-                address: socket.remoteAddress,
-                connectedAt: Date.now(),
-            };
-
-            const state: ClientState = {
-                socket,
-                connection,
-                protocol: createProtocolState(connection.id),
-                buffer: new Uint8Array(4096),
-                bufferLength: 0,
-            };
-
-            socket.data = { state };
-            clients.set(connection.id, state);
-
-            console.log(
-                `🔌 [${
-                    connection.id.slice(0, 8)
-                }] Connected from ${connection.address}`,
-            );
+    // Effect interpreter (performs side effects)
+    const interpreter: EffectInterpreter = {
+        sendPacket: (connId: string, packet: OutgoingPacket) => {
+            const socket = sockets.get(connId);
+            if (socket) {
+                const bytes = encodePacket(packet);
+                socket.write(bytes);
+            }
         },
-
-        /**
-         * Data received - PIPELINE STARTS HERE
-         */
-        data(socket, chunk) {
-            const { state } = socket.data;
-
-            try {
-                // Step 1: NETWORK LAYER - accumulate bytes
-                const incomingData = new Uint8Array(chunk);
-
-                // Expand buffer if needed
-                if (
-                    state.bufferLength + incomingData.length >
-                        state.buffer.length
-                ) {
-                    const newBuffer = new Uint8Array(state.buffer.length * 2);
-                    newBuffer.set(state.buffer.subarray(0, state.bufferLength));
-                    state.buffer = newBuffer;
-                }
-
-                state.buffer.set(incomingData, state.bufferLength);
-                state.bufferLength += incomingData.length;
-
-                // Step 2: Process complete packets
-                processPackets(state);
-            } catch (error) {
-                console.error(
-                    `❌ [${state.connection.id.slice(0, 8)}] Error:`,
-                    error,
-                );
+        disconnect: (connId: string, reason: string) => {
+            const socket = sockets.get(connId);
+            if (socket) {
                 socket.end();
+                sockets.delete(connId);
             }
+            console.log(`Disconnected ${connId}: ${reason}`);
         },
-
-        /**
-         * Connection closed
-         */
-        close(socket) {
-            const { state } = socket.data;
-            clients.delete(state.connection.id);
-
-            const duration =
-                ((Date.now() - state.connection.connectedAt) / 1000).toFixed(2);
-            console.log(
-                `🔌 [${
-                    state.connection.id.slice(0, 8)
-                }] Disconnected (${duration}s)`,
-            );
+        log: (level: string, message: string) => {
+            const timestamp = new Date().toISOString();
+            console.log(`[${timestamp}] [${level.toUpperCase()}] ${message}`);
         },
+    };
 
-        /**
-         * Socket error
-         */
-        error(socket, error) {
-            const { state } = socket.data;
-            console.error(
-                `❌ [${state.connection.id.slice(0, 8)}] Socket error:`,
-                error.message,
-            );
-        },
-    },
-});
+    // Process accumulated bytes in connection buffer
+    const processBuffer = (connId: string) => {
+        // We must retrieve the connection object within the loop
+        // to ensure we always have the latest state.
+        // Start by getting the connection and buffer.
+        let conn = state.connections.get(connId);
+        if (!conn) return;
 
-console.log(`✅ Server listening on ${CONFIG.hostname}:${CONFIG.port}`);
-console.log("🔌 Waiting for connections...\n");
+        let buffer = conn.readBuffer;
 
-/**
- * Process accumulated buffer into complete packets
- * PIPELINE: raw bytes → protocol decoding
- */
-function processPackets(state: ClientState): void {
-    while (state.bufferLength > 0) {
-        // Try to read packet length
-        if (state.bufferLength < 1) return;
+        while (buffer.length > 0) {
+            // Use the LATEST state from the conn object
+            const result = decodePacket(buffer, conn.state);
 
-        let packetLength: number;
-        let lengthSize: number;
+            if (!result.success) {
+                if (result.reason === "incomplete") {
+                    break; // Wait for more data
+                } else if (result.reason === "invalid") {
+                    // Disconnect on invalid packet (best practice)
+                    // Ensure your handler logic from previous steps is still here.
+                    runEffects([
+                        {
+                            type: "disconnect",
+                            connId,
+                            reason: "Invalid packet received",
+                        },
+                        {
+                            type: "log",
+                            level: "error",
+                            message: `Invalid packet received from ${connId}`,
+                        },
+                    ], interpreter);
+                    return; // Stop processing
+                }
+            }
 
-        try {
-            [packetLength, lengthSize] = decodeVarint32(
-                state.buffer.subarray(0, state.bufferLength),
-            );
-        } catch {
-            return; // Incomplete VarInt
-        }
-
-        // Check if we have complete packet
-        const totalSize = lengthSize + packetLength;
-        if (state.bufferLength < totalSize) return;
-
-        // Extract packet data (without length prefix)
-        const packetData = state.buffer.slice(lengthSize, totalSize);
-
-        // PIPELINE: protocol decode → handle packet
-        handlePacket(state, packetData);
-
-        // Remove processed packet from buffer
-        const remaining = state.bufferLength - totalSize;
-        if (remaining > 0) {
-            state.buffer.copyWithin(0, totalSize, state.bufferLength);
-        }
-        state.bufferLength = remaining;
-    }
-}
-
-/**
- * Handle a complete packet
- * PIPELINE: protocol → (future: server-logic → game-logic)
- */
-function handlePacket(state: ClientState, data: Uint8Array): void {
-    // PROTOCOL LAYER: decode packet
-    const packet = decodePacket(data, state.protocol);
-
-    const id = state.connection.id.slice(0, 8);
-
-    // Handle based on packet type
-    // (In Phase 1, we handle directly. Later: pass to server-logic)
-    switch (packet.state) {
-        case ConnectionState.HANDSHAKING: {
-            const handshake = packet as HandshakePacket;
-            console.log(
-                `📋 [${id}] Handshake: protocol=${handshake.protocolVersion}, next=${handshake.nextState}`,
-            );
-
-            transitionState(state.protocol, handshake.nextState);
-            console.log(
-                `→  [${id}] Transitioned to ${
-                    ConnectionState[handshake.nextState]
-                }`,
-            );
-            break;
-        }
-
-        case ConnectionState.STATUS: {
-            if (packet.id === 0x00) {
-                // Status Request
-                console.log(`📊 [${id}] Status request`);
-
-                const statusJson: ServerStatusJson = {
-                    version: {
-                        name: MINECRAFT_VERSION,
-                        protocol: PROTOCOL_VERSION,
-                    },
-                    players: {
-                        max: CONFIG.maxPlayers,
-                        online: clients.size - 1, // -1 to exclude this connection
-                    },
-                    description: {
-                        text: CONFIG.motd,
-                    },
+            // TypeScript knows result.success === true here
+            if (result.success) {
+                const ctx = {
+                    state,
+                    connId,
+                    packet: result.packet,
                 };
+                const handlerResult = handlePacket(ctx);
 
-                const response = encodePacket({
-                    state: ConnectionState.STATUS,
-                    id: 0x00,
-                    json: JSON.stringify(statusJson),
-                });
+                // 1. Update the global state
+                state = handlerResult.newState;
 
-                state.socket.write(response);
-                console.log(`✅ [${id}] Sent status response`);
-            } else if (packet.id === 0x01) {
-                // Ping
-                console.log(`🏓 [${id}] Ping: ${packet.payload}`);
+                // 2. 💥 CRITICAL FIX: Update the local 'conn' object with the new state
+                //    before the loop starts its next iteration.
+                const newConn = state.connections.get(connId);
+                if (!newConn) {
+                    // Connection was likely removed by a disconnect effect
+                    return;
+                }
+                conn = newConn; // Use the updated conn object for the next loop iteration
 
-                const pong = encodePacket({
-                    state: ConnectionState.STATUS,
-                    id: 0x01,
-                    payload: packet.payload,
-                });
+                // Run effects
+                runEffects(handlerResult.effects, interpreter);
 
-                state.socket.write(pong);
-                console.log(`✅ [${id}] Sent pong`);
+                // Continue with remaining bytes
+                buffer = result.remaining;
             }
-            break;
         }
 
-        default:
-            console.error(`❌ [${id}] Unhandled state: ${packet.state}`);
-            state.socket.end();
-    }
+        // Update connection buffer one final time outside the loop
+        state = updateConnection(state, connId, (c) => ({
+            ...c,
+            readBuffer: buffer,
+        }));
+    };
+
+    // Start TCP server
+    const server = Bun.listen({
+        hostname: "0.0.0.0",
+        port: PORT,
+        socket: {
+            open(socket) {
+                const connId = crypto.randomUUID();
+                sockets.set(connId, socket);
+
+                state = addConnection(state, {
+                    id: connId,
+                    state: "handshaking",
+                    readBuffer: new Uint8Array(0),
+                });
+
+                console.log(`[INFO] New connection: ${connId}`);
+            },
+
+            data(socket, data) {
+                const connId = Array.from(sockets.entries()).find(
+                    ([_, s]) => s === socket,
+                )?.[0];
+
+                if (!connId) return;
+
+                // Append new data to buffer
+                state = updateConnection(state, connId, (conn) => {
+                    const newBuffer = new Uint8Array(
+                        conn.readBuffer.length + data.length,
+                    );
+                    newBuffer.set(conn.readBuffer, 0);
+                    newBuffer.set(data, conn.readBuffer.length);
+                    return { ...conn, readBuffer: newBuffer };
+                });
+
+                // Process accumulated data
+                processBuffer(connId);
+            },
+
+            close(socket) {
+                const connId = Array.from(sockets.entries()).find(
+                    ([_, s]) => s === socket,
+                )?.[0];
+
+                if (connId) {
+                    state = removeConnection(state, connId);
+                    sockets.delete(connId);
+                    console.log(`[INFO] Connection closed: ${connId}`);
+                }
+            },
+
+            error(socket, error) {
+                console.error("[ERROR] Socket error:", error);
+            },
+        },
+    });
+
+    console.log(`\n🚀 NeoMinecraft server started on port ${PORT}`);
+    console.log(`📊 Add server in Minecraft: localhost:${PORT}\n`);
+
+    return server;
 }
 
-// Graceful shutdown
-process.on("SIGINT", () => {
-    console.log("\n🛑 Shutting down...");
-    server.stop();
-    process.exit(0);
-});
+createServer();

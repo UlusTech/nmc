@@ -1,36 +1,39 @@
-/**
- * Main packet encoder - structured packets → bytes
- */
+// ============================================
+// FILE: src/protocol/codec/encode.ts
+// ============================================
 
-import type { ServerboundPacket } from "../types";
-import { ConnectionState } from "../constants";
-import { encodePong, encodeStatusResponse } from "../packets/status";
+import type { OutgoingPacket } from "../types.ts";
+import { encodeString, encodeVarInt } from "./varint.ts";
 
-/**
- * Encode a packet to bytes
- */
-export function encodePacket(packet: ServerboundPacket): Uint8Array {
-    switch (packet.state) {
-        case ConnectionState.STATUS:
-            if (packet.id === 0x00) {
-                return encodeStatusResponse(packet);
-            }
-            if (packet.id === 0x01) {
-                return encodePong(packet);
-            }
-            throw new Error(
-                //@ts-expect-error its says id not exist
-                `Unknown status packet: 0x${packet.id.toString(16)}`,
-            );
+/** Encode outgoing packet to bytes */
+export function encodePacket(packet: OutgoingPacket): Uint8Array {
+    let packetId: number;
+    let data: Uint8Array;
 
-            //@ts-expect-error Type 'ConnectionState.LOGIN' is not comparable to type 'ConnectionState.STATUS'.ts(2678) because Login packets not implemented yet
-        case ConnectionState.LOGIN:
-            throw new Error("Login packets not implemented yet");
-            //@ts-expect-error
-        case ConnectionState.PLAY:
-            throw new Error("Play packets not implemented yet");
-
-        default:
-            throw new Error(`Unknown connection state: ${packet.state}`);
+    if (packet.type === "status_response") {
+        packetId = 0x00;
+        const json = JSON.stringify(packet.response);
+        data = encodeString(json);
+    } else if (packet.type === "ping_response") {
+        packetId = 0x01;
+        data = new Uint8Array(8);
+        const view = new DataView(data.buffer);
+        view.setBigInt64(0, packet.payload, false); // Big-endian
+    } else {
+        throw new Error(`Unknown packet type: ${(packet as any).type}`);
     }
+
+    // Build packet: [packet ID][data]
+    const packetIdBytes = encodeVarInt(packetId);
+    const packetContent = new Uint8Array(packetIdBytes.length + data.length);
+    packetContent.set(packetIdBytes, 0);
+    packetContent.set(data, packetIdBytes.length);
+
+    // Build frame: [length][packet ID][data]
+    const length = encodeVarInt(packetContent.length);
+    const frame = new Uint8Array(length.length + packetContent.length);
+    frame.set(length, 0);
+    frame.set(packetContent, length.length);
+
+    return frame;
 }
