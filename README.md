@@ -1,3 +1,4 @@
+Currently, project is fully ai slope. We will work on this project later.
 # NeoMinecraft
 
 To install dependencies:
